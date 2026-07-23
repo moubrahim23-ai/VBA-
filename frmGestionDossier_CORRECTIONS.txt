@@ -1,0 +1,371 @@
+'===============================================================================
+' CORRECTIONS A APPLIQUER DANS frmGestionDossier (module de formulaire existant)
+'===============================================================================
+'
+' Ce fichier n'est PAS un module a importer tel quel. Il contient les
+' procedures qui doivent REMPLACER leur equivalent dans le formulaire
+' frmGestionDossier deja existant. Pour chaque bloc ci-dessous :
+'   1. Ouvrez frmGestionDossier dans l'editeur VBA (Alt+F11)
+'   2. Cherchez la procedure du meme nom
+'   3. Remplacez-la entierement par la version ci-dessous
+'
+' A FAIRE EN PLUS (une fois) :
+'   - SUPPRIMER entierement la fonction "GetDomainStructure" du formulaire
+'     (~lignes 1063-1072 de l'original) : elle duplique modConfig et empeche
+'     toute correction centrale d'avoir un effet (VBA privilegie la copie
+'     locale au module lors d'un appel non qualifie depuis le formulaire).
+'   - SUPPRIMER entierement "Sub MatchAndCopy()" du formulaire (~lignes
+'     685-738) : remplacee par modTraceSync.SyncTraceSheet.
+'   - SUPPRIMER le module Module2.bas (contient une 2e copie de MatchAndCopy,
+'     jamais appelee - code mort).
+'   - SUPPRIMER "RechercherNonConforme" et "ParcourirDossier" (~lignes
+'     807-880) : jamais appelees, LoadFichiers_NC fait deja ce travail.
+'   - NON TRAITE ICI (necessite votre arbitrage) : la variable "isEditing"
+'     dans LoadSelectedData (~ligne 1078) n'a aucun effet car elle est
+'     declaree en local. Si elle devait activer un vrai mode "modification"
+'     dans CDeplacer_Click plutot que "toujours ajouter une nouvelle ligne",
+'     dites-moi comment ce mode doit se comporter et je le cablerai.
+'
+'===============================================================================
+
+
+' ------------------------------------------------------------------------------
+' UserForm_Initialize
+' Corrige : les listes de domaines (CDomaine vs cboRacine) divergeaient
+' (9 items vs 6). Elles utilisent maintenant toutes les deux la meme source,
+' modConfig.GetDomaines().
+' ------------------------------------------------------------------------------
+Private Sub UserForm_Initialize()
+    ' Centrer la fenetre
+    Me.StartUpPosition = 0
+    Me.Left = Application.Left + (Application.Width - Me.Width) / 2
+    Me.Top = Application.Top + (Application.Height - Me.Height) / 2
+
+    ' Charger les domaines (dossier reseau, pour l'onglet principal)
+    LoadDomaines
+
+    Dim item As Variant
+
+    ' Statuts
+    cmbStatutSource.Clear
+    For Each item In modConfig.GetStatutsSource()
+        cmbStatutSource.AddItem item
+    Next item
+
+    cmbStatutDestination.Clear
+    For Each item In modConfig.GetStatutsDestination()
+        cmbStatutDestination.AddItem item
+    Next item
+
+    cmbStatutSource.ListIndex = 0
+    cmbStatutDestination.ListIndex = 0
+    txtAgent.Value = Environ("USERNAME")
+
+    basePath = modConfig.ROOT_PATH & "\"
+
+    ' Domaines (meme liste pour les deux onglets - anciennement 6 items ici
+    ' contre 9 dans CDomaine ci-dessous)
+    cboRacine.Clear
+    CDomaine.Clear
+    For Each item In modConfig.GetDomaines()
+        cboRacine.AddItem item
+        CDomaine.AddItem item
+    Next item
+
+    lstResultats.ColumnCount = 2
+    lstResultats.ColumnWidths = "300 pt;0 pt"
+End Sub
+
+
+' ------------------------------------------------------------------------------
+' CGO_Click (onglet saisie manuelle)
+' Corrige : liste de sous-domaines codee en dur et divergente de celle de
+' cboRacine_Change / modInitialization. Vient maintenant de modConfig.
+' ------------------------------------------------------------------------------
+Private Sub CGO_Click()
+    Dim sousDomaines As Variant, item As Variant
+
+    CSousDomaine.Clear
+    sousDomaines = modConfig.GetSousDomaines(CDomaine.Value)
+    For Each item In sousDomaines
+        CSousDomaine.AddItem item
+    Next item
+    If CSousDomaine.ListCount = 1 Then CSousDomaine.Value = CSousDomaine.List(0)
+
+    Call RefreshListView
+End Sub
+
+
+' ------------------------------------------------------------------------------
+' cboRacine_Change (onglet recherche NON CONFORME)
+' Corrige : listes codees en dur ("Tarfif", "Granties"...) divergentes de
+' celles de CGO_Click. Le cas ACM reste un scan reel du disque (comportement
+' d'origine conserve : il reflete la structure de dossiers reelle, ce qui est
+' plus fiable qu'une liste statique).
+' ------------------------------------------------------------------------------
+Private Sub cboRacine_Change()
+    Dim cheminACM As String
+    Dim dossier As Object, sousDossier As Object
+    Dim sousDomaines As Variant, item As Variant
+
+    cboSousDossier.Clear
+
+    If cboRacine.Value = "ACM" Then
+        cheminACM = basePath & "ACM\NON CONFORME\"
+        If modUtils.FolderExists(cheminACM) Then
+            Set dossier = modUtils.GetFSO().GetFolder(cheminACM)
+            For Each sousDossier In dossier.SubFolders
+                cboSousDossier.AddItem sousDossier.Name
+            Next sousDossier
+        End If
+    Else
+        sousDomaines = modConfig.GetSousDomaines(cboRacine.Value)
+        For Each item In sousDomaines
+            cboSousDossier.AddItem item
+        Next item
+    End If
+End Sub
+
+
+' ------------------------------------------------------------------------------
+' cmdDeplacer_Click (onglet principal, deplacement manuel entre 2 statuts)
+' Corrige :
+'   - MsgBox de debogage (aucune dans l'original ici, mais on verifie
+'     desormais l'existence du fichier source avant de tenter le Name)
+'   - construction du chemin destination pour un domaine SIMPLE : l'original
+'     ne rajoutait JAMAIS le statut de destination dans ce cas
+'     (dstPath = ROOT_PATH & "\" & cmbDomaine & "\" & ""), ce qui contredit
+'     LoadFichiers qui lit bien un sous-dossier de statut. Corrige.
+'   - appel a LogAction avec la nouvelle signature explicite (fini l'ordre
+'     de parametres qui se compensait "par chance" avec l'ecriture interne)
+' ------------------------------------------------------------------------------
+Private Sub cmdDeplacer_Click()
+    Dim srcPath As String, dstPath As String
+    Dim fileName As String
+    Dim structType As modConfig.StructureType
+
+    If lstFichiers.ListIndex = -1 Or lstFichiers.Value = "[DOSSIER VIDE]" Then
+        MsgBox "Selectionnez un fichier", vbExclamation
+        Exit Sub
+    End If
+    If Trim$(txtAgent.Value) = "" Then
+        MsgBox "Agent requis", vbCritical
+        Exit Sub
+    End If
+
+    fileName = lstFichiers.Value
+    structType = modConfig.GetDomainStructure(cmbDomaine.Value)
+
+    Select Case structType
+        Case modConfig.THREE_LEVEL
+            srcPath = modConfig.ROOT_PATH & "\" & cmbDomaine.Value & "\" & cmbStatutSource.Value & "\" & cmbSousDomaine.Value
+            dstPath = modConfig.ROOT_PATH & "\" & cmbDomaine.Value & "\" & cmbStatutDestination.Value & "\" & cmbSousDomaine.Value
+        Case modConfig.Complex
+            srcPath = modConfig.ROOT_PATH & "\" & cmbDomaine.Value & "\" & cmbSousDomaine.Value & "\" & cmbStatutSource.Value
+            dstPath = modConfig.ROOT_PATH & "\" & cmbDomaine.Value & "\" & cmbSousDomaine.Value & "\" & cmbStatutDestination.Value
+        Case Else ' SIMPLE
+            srcPath = modConfig.ROOT_PATH & "\" & cmbDomaine.Value & "\" & cmbStatutSource.Value
+            dstPath = modConfig.ROOT_PATH & "\" & cmbDomaine.Value & "\" & cmbStatutDestination.Value
+    End Select
+
+    srcPath = srcPath & "\" & fileName
+
+    If Not modUtils.FileExists(srcPath) And Not modUtils.FolderExists(srcPath) Then
+        MsgBox "Introuvable a la source : " & srcPath, vbCritical
+        Exit Sub
+    End If
+
+    modUtils.CreateFolderIfNotExists dstPath
+    dstPath = dstPath & "\" & fileName
+
+    Name srcPath As dstPath
+
+    modUtils.LogAction "Deplacement", fileName, cmbDomaine.Value, cmbSousDomaine.Value, _
+                        txtAgent.Value, cmbStatutSource.Value, cmbStatutDestination.Value, _
+                        txtCommentaire.Value
+
+    LoadFichiers
+    txtCommentaire.Value = ""
+
+    MsgBox "Fichier deplace avec succes !", vbInformation
+End Sub
+
+
+' ------------------------------------------------------------------------------
+' CommandButton1_Click (finaliser vers TRAITES / NON CONFORME)
+' Corrige :
+'   - 4 MsgBox de debogage retirees (MsgBox srcPath / dstPath / destinationFinale)
+'   - le dossier choisi via la boite de dialogue n'est plus deconnecte
+'     silencieusement de l'element selectionne dans la liste : verification
+'     + confirmation ajoutee
+'   - ordre securise : copie vers Historique ET vers la destination AVANT de
+'     supprimer l'original (l'original renommait vers Historique en premier,
+'     ce qui pouvait faire disparaitre un dossier si la copie suivante
+'     echouait)
+'   - appel a LogAction corrige + remplace le bloc de reconstruction du
+'     suivi (dupliquait CommandButton3_Click avec un mappage de colonnes
+'     different) par un seul appel a modTraceSync.SyncTraceSheet
+' ------------------------------------------------------------------------------
+Private Sub CommandButton1_Click()
+    On Error GoTo GestionErreur
+
+    Dim dossierSource As String, destinationPath As String, destinationFinale As String
+    Dim histoPath As String, nomDossier As String, fileName As String, statutFinal As String
+
+    If lstFichiers.ListIndex = -1 Or lstFichiers.Value = "[DOSSIER VIDE]" Then
+        MsgBox "Selectionnez un fichier", vbExclamation
+        Exit Sub
+    End If
+
+    If optTraites.Value = True Then
+        statutFinal = modConfig.STATUT_TRAITES
+    ElseIf optNonConforme.Value = True Then
+        statutFinal = modConfig.STATUT_NON_CONFORME
+    Else
+        MsgBox "Veuillez selectionner TRAITES ou NON CONFORME.", vbExclamation
+        Exit Sub
+    End If
+
+    If statutFinal = modConfig.STATUT_NON_CONFORME And Trim$(txtCommentaire.Value) = "" Then
+        MsgBox "Un commentaire est obligatoire pour un classement NON CONFORME.", vbExclamation
+        Exit Sub
+    End If
+
+    fileName = lstFichiers.Value
+
+    With Application.FileDialog(msoFileDialogFolderPicker)
+        .Title = "Selectionner le dossier a deplacer (" & fileName & ")"
+        If .Show <> -1 Then Exit Sub
+        dossierSource = .SelectedItems(1)
+    End With
+    If Right$(dossierSource, 1) = "\" Then dossierSource = Left$(dossierSource, Len(dossierSource) - 1)
+    nomDossier = modUtils.GetFSO().GetFolder(dossierSource).Name
+
+    ' Garde-fou ajoute par l'audit (cf. rapport, point 3.1-F) : on avertit si
+    ' le dossier choisi manuellement ne correspond pas a la selection de la
+    ' liste, au lieu de deplacer silencieusement autre chose que prevu.
+    If StrComp(nomDossier, fileName, vbTextCompare) <> 0 Then
+        If MsgBox("Le dossier choisi (" & nomDossier & ") ne correspond pas a l'element " & _
+                   "selectionne dans la liste (" & fileName & ")." & vbCrLf & _
+                   "Continuer quand meme ?", vbYesNo + vbExclamation) = vbNo Then
+            Exit Sub
+        End If
+        fileName = nomDossier
+    End If
+
+    Select Case modConfig.GetDomainStructure(cmbDomaine.Value)
+        Case modConfig.THREE_LEVEL
+            destinationPath = modConfig.ROOT_PATH & "\" & cmbDomaine.Value & "\" & statutFinal & "\" & cmbSousDomaine.Value
+        Case modConfig.Complex
+            destinationPath = modConfig.ROOT_PATH & "\" & cmbDomaine.Value & "\" & cmbSousDomaine.Value & "\" & statutFinal
+        Case Else
+            destinationPath = modConfig.ROOT_PATH & "\" & cmbDomaine.Value & "\" & statutFinal
+    End Select
+
+    modUtils.CreateFolderIfNotExists destinationPath
+    destinationFinale = destinationPath & "\" & nomDossier
+    histoPath = modConfig.HISTO_PATH & "\" & nomDossier
+
+    If modUtils.FolderExists(destinationFinale) Then
+        MsgBox "Le dossier existe deja a destination.", vbExclamation
+        Exit Sub
+    End If
+
+    ' Copie vers Historique ET vers la destination AVANT toute suppression.
+    modUtils.GetFSO().CopyFolder dossierSource, histoPath, True
+    modUtils.GetFSO().CopyFolder dossierSource, destinationFinale, True
+
+    If Not modUtils.FolderExists(destinationFinale) Then
+        MsgBox "Erreur lors de la copie.", vbCritical
+        Exit Sub
+    End If
+
+    modUtils.GetFSO().DeleteFolder dossierSource, True
+
+    modUtils.LogAction "Deplacement", fileName, cmbDomaine.Value, cmbSousDomaine.Value, _
+                        txtAgent.Value, modConfig.STATUT_EN_COURS, statutFinal, txtCommentaire.Value
+
+    modTraceSync.SyncTraceSheet
+
+    LoadFichiers
+    txtCommentaire.Value = ""
+
+    MsgBox "Dossier deplace vers " & statutFinal, vbInformation
+    Exit Sub
+
+GestionErreur:
+    MsgBox "Erreur : " & Err.Number & " - " & Err.Description, vbCritical
+End Sub
+
+
+' ------------------------------------------------------------------------------
+' CommandButton2_Click (resoudre un NON CONFORME vers TRAITES)
+' Corrige : appelle desormais LogActionNC (bug de nom de feuille corrige, cf.
+' modUtils.bas) et modTraceSync.SyncTraceSheet au lieu du bloc Dictionary
+' local (3e implementation divergente de la meme logique).
+' ------------------------------------------------------------------------------
+Private Sub CommandButton2_Click()
+    On Error GoTo GestionErreur
+
+    Dim dossierSource As String, destinationPath As String, destinationFinale As String
+    Dim nomDossier As String, fileName As String, histoPath As String
+
+    If lstResultats.ListIndex = -1 Then
+        MsgBox "Selectionnez un dossier.", vbExclamation
+        Exit Sub
+    End If
+
+    fileName = lstResultats.Value
+    dossierSource = lstResultats.List(lstResultats.ListIndex, 1)
+    nomDossier = modUtils.GetFSO().GetFolder(dossierSource).Name
+
+    Select Case modConfig.GetDomainStructure(cboRacine.Value)
+        Case modConfig.Complex
+            destinationPath = modConfig.ROOT_PATH & "\" & cboRacine.Value & "\" & cboSousDossier.Value & "\" & modConfig.STATUT_TRAITES
+        Case modConfig.THREE_LEVEL
+            destinationPath = modConfig.ROOT_PATH & "\" & cboRacine.Value & "\" & modConfig.STATUT_TRAITES & "\" & cboSousDossier.Value
+        Case Else
+            destinationPath = modConfig.ROOT_PATH & "\" & cboRacine.Value & "\" & modConfig.STATUT_TRAITES
+    End Select
+
+    destinationFinale = destinationPath & "\" & nomDossier
+    histoPath = modConfig.HISTO_PATH & "\" & nomDossier
+
+    If modUtils.FolderExists(destinationFinale) Then
+        MsgBox "Le dossier existe deja dans TRAITES.", vbExclamation
+        Exit Sub
+    End If
+
+    modUtils.GetFSO().CopyFolder dossierSource, histoPath, True
+    modUtils.GetFSO().MoveFolder dossierSource, destinationFinale
+
+    If Not modUtils.FolderExists(destinationFinale) Then
+        MsgBox "Erreur lors du deplacement.", vbCritical
+        Exit Sub
+    End If
+
+    MsgBox "Dossier deplace avec succes.", vbInformation
+
+    modUtils.LogActionNC "Deplacement", fileName, txtAgent.Value, "de NON CONFORME a TRAITES"
+
+    modTraceSync.SyncTraceSheet
+
+    LoadFichiers_NC
+    MsgBox "Traitement termine.", vbInformation
+    Exit Sub
+
+GestionErreur:
+    MsgBox "Erreur " & Err.Number & vbCrLf & Err.Description, vbCritical
+End Sub
+
+
+' ------------------------------------------------------------------------------
+' CommandButton3_Click (regenerer la feuille de suivi)
+' Corrige : remplace ~55 lignes dupliquees (et incompatibles avec les autres
+' copies) par un seul appel a la logique centrale.
+' ------------------------------------------------------------------------------
+Private Sub CommandButton3_Click()
+    modTraceSync.SyncTraceSheet
+    LoadFichiers
+    txtCommentaire.Value = ""
+End Sub

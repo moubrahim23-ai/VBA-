@@ -1,0 +1,216 @@
+Attribute VB_Name = "modTraceSync"
+Option Explicit
+
+'===============================================================================
+' modTraceSync  (NOUVEAU MODULE)
+'
+' Corrige l'audit du 2026-07-22, point le plus important :
+'   L'ancien projet contenait 3 implementations differentes et incompatibles
+'   de "reconstruire SHEET_TRACE_NAME a partir du journal" :
+'     - CommandButton3_Click (ecrit dans les colonnes 1-9)
+'     - le bloc inline de CommandButton1_Click (ecrit dans 1,2,3,4,6,7,9,10,12)
+'     - MatchAndCopy / le bloc Dictionary de CommandButton2_Click (5,8,11)
+'   Les trois supposaient en plus qu'un dossier genere EXACTEMENT 2 lignes de
+'   journal (une paire), ce qui echoue des qu'un dossier passe par NON
+'   CONFORME ou est retraite plusieurs fois.
+'
+'   Cette version REGROUPE les evenements PAR NOM DE FICHIER (et non plus par
+'   paire de lignes consecutives), fusionne LOG_ACTIONS et NC_LOG_ACTIONS, et
+'   supporte nativement un nombre quelconque d'etapes par dossier.
+'
+'   Colonnes ecrites dans SHEET_TRACE_NAME (en-tetes REELS actuels du
+'   classeur) : NomFichier(1) Domaine(2) SousDomaine(3) Statut(4)
+'   Date_A_TRAITER(6) Date_FIN(7) Agent(9) DMT(10) Commentaire(12).
+'   Les colonnes 5 (Status_2), 8 (Date_de_Retraitement), 11 (DMt_2) et 13 (i)
+'   ont ete ajoutees a la main dans le classeur et ne sont pas gerees ici :
+'   je ne connais pas leur usage prevu, donc je ne les touche pas.
+'===============================================================================
+
+Private Const COL_NOMFICHIER As Long = 1
+Private Const COL_DOMAINE As Long = 2
+Private Const COL_SOUSDOMAINE As Long = 3
+Private Const COL_STATUT As Long = 4
+Private Const COL_DATE_A_TRAITER As Long = 6
+Private Const COL_DATE_FIN As Long = 7
+Private Const COL_AGENT As Long = 9
+Private Const COL_DMT As Long = 10
+Private Const COL_COMMENTAIRE As Long = 12
+
+' Point d'entree unique. Remplace CommandButton3_Click, le bloc inline de
+' CommandButton1_Click, MatchAndCopy et le bloc Dictionary de CommandButton2_Click.
+Public Sub SyncTraceSheet()
+    Dim wsTrace As Worksheet
+    Dim events As Object ' Dictionary(baseName) -> Collection de Dictionary "evenement"
+    Dim outputRow As Long
+    Dim key As Variant
+
+    Set wsTrace = ThisWorkbook.Sheets(modConfig.SHEET_TRACE)
+    Set events = CreateObject("Scripting.Dictionary")
+
+    CollectMainLog events
+    CollectNCLog events
+
+    Application.ScreenUpdating = False
+    On Error GoTo CleanFail
+
+    wsTrace.Rows("2:" & wsTrace.Rows.Count).ClearContents
+    outputRow = 2
+    For Each key In events.Keys
+        WriteTraceRow wsTrace, outputRow, events(key)
+        outputRow = outputRow + 1
+    Next key
+
+    Application.ScreenUpdating = True
+    MsgBox "Suivi regenere : " & (outputRow - 2) & " dossier(s).", vbInformation
+    Exit Sub
+
+CleanFail:
+    Application.ScreenUpdating = True
+    MsgBox "Erreur pendant la regeneration du suivi : " & Err.Description, vbCritical
+End Sub
+
+' ------------------------------------------------------------------- Collecte --
+
+Private Sub CollectMainLog(events As Object)
+    Dim wsLog As Worksheet
+    Dim lastRow As Long, i As Long
+    Dim fullName As String, baseName As String
+
+    On Error Resume Next
+    Set wsLog = ThisWorkbook.Sheets(modConfig.SHEET_LOG)
+    On Error GoTo 0
+    If wsLog Is Nothing Then Exit Sub
+
+    lastRow = wsLog.Cells(wsLog.Rows.Count, 1).End(xlUp).row
+    For i = 2 To lastRow
+        fullName = Trim$(CStr(wsLog.Cells(i, 3).Value))
+        If fullName <> "" Then
+            baseName = StripExtension(fullName)
+            If Not events.Exists(baseName) Then Set events(baseName) = New Collection
+            events(baseName).Add MakeEvent( _
+                wsLog.Cells(i, 1).Value, fullName, _
+                CStr(wsLog.Cells(i, 4).Value), CStr(wsLog.Cells(i, 7).Value), _
+                CStr(wsLog.Cells(i, 5).Value), CStr(wsLog.Cells(i, 6).Value), _
+                CStr(wsLog.Cells(i, 8).Value))
+        End If
+    Next i
+End Sub
+
+Private Sub CollectNCLog(events As Object)
+    Dim wsLogNC As Worksheet
+    Dim lastRow As Long, i As Long
+    Dim fullName As String, baseName As String
+    Dim statusText As String
+
+    On Error Resume Next
+    Set wsLogNC = ThisWorkbook.Sheets(modConfig.SHEET_LOG_NC)
+    On Error GoTo 0
+    If wsLogNC Is Nothing Then Exit Sub
+
+    ' Une entree NC_LOG_ACTIONS represente TOUJOURS une resolution
+    ' NON CONFORME -> TRAITES (c'est la seule action que ce journal enregistre).
+    statusText = modConfig.STATUT_NON_CONFORME & " " & modConfig.STATUS_SEP_NEW & " " & modConfig.STATUT_TRAITES
+
+    lastRow = wsLogNC.Cells(wsLogNC.Rows.Count, 1).End(xlUp).row
+    For i = 2 To lastRow
+        fullName = Trim$(CStr(wsLogNC.Cells(i, 3).Value))
+        If fullName <> "" Then
+            baseName = StripExtension(fullName)
+            If Not events.Exists(baseName) Then Set events(baseName) = New Collection
+            events(baseName).Add MakeEvent( _
+                wsLogNC.Cells(i, 1).Value, fullName, _
+                "", "", CStr(wsLogNC.Cells(i, 4).Value), statusText, _
+                "(resolu depuis NON CONFORME : " & CStr(wsLogNC.Cells(i, 5).Value) & ")")
+        End If
+    Next i
+End Sub
+
+Private Function MakeEvent(evtDate As Variant, fileName As String, domaine As String, _
+                            sousDomaine As String, agent As String, statusText As String, _
+                            comment As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("Date") = evtDate
+    d("FileName") = fileName
+    d("Domaine") = domaine
+    d("SousDomaine") = sousDomaine
+    d("Agent") = agent
+    d("StatusText") = statusText
+    d("Comment") = comment
+    Set MakeEvent = d
+End Function
+
+' -------------------------------------------------------------------- Ecriture --
+
+Private Sub WriteTraceRow(ws As Worksheet, row As Long, events As Collection)
+    Dim firstEvt As Object, lastEvt As Object
+    Dim dateDebut As Variant, dateFin As Variant
+
+    Set firstEvt = events(1)
+    Set lastEvt = events(events.Count)
+
+    dateDebut = firstEvt("Date")
+    dateFin = lastEvt("Date")
+
+    ws.Cells(row, COL_NOMFICHIER).Value = lastEvt("FileName")
+    ws.Cells(row, COL_DOMAINE).Value = LastNonBlank(events, "Domaine")
+    ws.Cells(row, COL_SOUSDOMAINE).Value = LastNonBlank(events, "SousDomaine")
+    ws.Cells(row, COL_STATUT).Value = ParseDestinationStatus(CStr(lastEvt("StatusText")))
+    ws.Cells(row, COL_AGENT).Value = LastNonBlank(events, "Agent")
+    ws.Cells(row, COL_COMMENTAIRE).Value = LastNonBlank(events, "Comment")
+
+    If IsDate(dateDebut) Then
+        ws.Cells(row, COL_DATE_A_TRAITER).Value = dateDebut
+        ws.Cells(row, COL_DATE_A_TRAITER).NumberFormat = "dd/mm/yyyy hh:mm"
+    End If
+    If IsDate(dateFin) Then
+        ws.Cells(row, COL_DATE_FIN).Value = dateFin
+        ws.Cells(row, COL_DATE_FIN).NumberFormat = "dd/mm/yyyy hh:mm"
+    End If
+    If IsDate(dateDebut) And IsDate(dateFin) Then
+        ws.Cells(row, COL_DMT).Value = CDate(dateFin) - CDate(dateDebut)
+        ws.Cells(row, COL_DMT).NumberFormat = "[hh]:mm"
+    End If
+End Sub
+
+' -------------------------------------------------------------------- Helpers --
+
+Private Function LastNonBlank(events As Collection, fieldName As String) As String
+    Dim i As Long
+    For i = events.Count To 1 Step -1
+        If Trim$(CStr(events(i)(fieldName))) <> "" Then
+            LastNonBlank = CStr(events(i)(fieldName))
+            Exit Function
+        End If
+    Next i
+    LastNonBlank = ""
+End Function
+
+' Extrait le statut destination d'un texte "SOURCE <sep> DESTINATION", en
+' acceptant aussi bien le nouveau separateur "|" que l'ancien "?" herite des
+' 197 lignes historiques du journal.
+Private Function ParseDestinationStatus(ByVal statusText As String) As String
+    Dim parts() As String
+    Dim sep As String
+
+    statusText = Trim$(statusText)
+    If InStr(statusText, modConfig.STATUS_SEP_NEW) > 0 Then
+        sep = modConfig.STATUS_SEP_NEW
+    ElseIf InStr(statusText, modConfig.STATUS_SEP_LEGACY) > 0 Then
+        sep = modConfig.STATUS_SEP_LEGACY
+    Else
+        ParseDestinationStatus = statusText
+        Exit Function
+    End If
+
+    parts = Split(statusText, sep)
+    ParseDestinationStatus = Trim$(parts(UBound(parts)))
+End Function
+
+Private Function StripExtension(ByVal fileName As String) As String
+    If InStrRev(fileName, ".") > 0 Then
+        StripExtension = UCase$(Left$(fileName, InStrRev(fileName, ".") - 1))
+    Else
+        StripExtension = UCase$(fileName)
+    End If
+End Function
